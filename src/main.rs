@@ -85,6 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("tracing::info")),
         )
+        .with_writer(std::io::stdout)
         .init();
 
     tracing::info!("Listening on http://{}", addr);
