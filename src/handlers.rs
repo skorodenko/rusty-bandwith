@@ -2,7 +2,7 @@ use crate::cli::AppConfig;
 use crate::util;
 use axum::{
     extract::{rejection::QueryRejection, Query, RawQuery, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -23,6 +23,7 @@ pub async fn root_handler() -> &'static str {
 
 pub async fn proxy_handler(
     RawQuery(raw_query): RawQuery,
+    mut headers: HeaderMap,
     params: Result<Query<ImageParams>, QueryRejection>,
     State(config): State<Arc<AppConfig>>,
 ) -> Result<Response, (StatusCode, String)> {
@@ -45,17 +46,24 @@ pub async fn proxy_handler(
         params.bw,
     );
 
-    // Download the image
-    let response = match reqwest::get(&params.url).await {
-        Ok(response) => response,
-        Err(e) => {
-            tracing::error!("Error fetching image: {}", e);
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("Error fetching image: {}", e),
-            ));
-        }
-    };
+    headers.remove(header::HOST);
+    headers.remove(header::CONTENT_LENGTH);
+    headers.remove(header::ACCEPT_ENCODING);
+    headers.remove("connection");
+    headers.remove("x-forwarded-for");
+
+    // Add hotlink protection header
+    if let Ok(referer) = params.url.parse() {
+        headers.insert(header::REFERER, referer);
+    }
+
+    let response = config
+        .client
+        .get(&params.url)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
 
     let status = response.status();
     if !status.is_success() {

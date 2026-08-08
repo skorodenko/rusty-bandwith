@@ -1,9 +1,12 @@
 use clap::{Parser, ValueHint};
 use std::net::{IpAddr, Ipv4Addr};
+use reqwest::Client;
 
 // Server configuration that's shared between threads
+#[derive(Clone)]
 pub struct AppConfig {
     pub mp_cap: Option<f32>,
+    pub client: Client,
 }
 
 // Command line arguments for configuring the server

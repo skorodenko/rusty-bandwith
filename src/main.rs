@@ -16,8 +16,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = cli::Args::parse();
 
     // Create shared configuration
+    let client = Client::new();
     let config = Arc::new(cli::AppConfig {
         mp_cap: args.mp_cap,
+        client
     });
 
     // Set up the server to listen on localhost with the specified port
@@ -32,12 +34,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Create a service that will handle incoming requests
     let config_clone = config.clone();
-    let client = Client::new();
     let app = Router::new()
         .route("/", get(handlers::proxy_handler))
         .route("/{*path}", get(handlers::proxy_handler))
-        .with_state(config_clone)
-        .with_state(client);
+        .with_state(config_clone);
 
     // Start the server
     match tokio::net::TcpListener::bind(addr).await {
