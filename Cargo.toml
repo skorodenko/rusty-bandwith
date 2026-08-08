@@ -10,6 +10,9 @@ tokio = { version = "1", features = ["full"] }
 percent-encoding = "2.1"
 image = { version = "*", features = ["webp"] }
 webp = "*"
-jpegxl-rs = "0.11"
-clap = { version = "4", features = ["derive"] }
+jpegxl-rs = "0.14"
+clap = { version = "4", features = ["derive", "env"] }
+fast_image_resize = "6.1.0"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 

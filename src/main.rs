@@ -1,27 +1,35 @@
 use clap::{Parser, ValueHint};
+use fast_image_resize::images::Image;
+use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode};
-use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba};
+use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb, Rgba};
 use jpegxl_rs::{encode::EncoderResult, encode::EncoderSpeed, encoder_builder};
 use percent_encoding::percent_decode_str;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
+use tracing;
+use tracing_subscriber::EnvFilter;
 
 // Command line arguments for configuring the server
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Host addr to listen on
-    #[arg(long, value_name = "HOST", default_value_t = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))]
+    #[arg(long, value_name = "HOST", env = "HOST", default_value_t = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))]
     host: IpAddr,
 
     /// Port to listen on
-    #[arg(long, value_name = "PORT", default_value_t = 8080, value_hint = ValueHint::Other)]
+    #[arg(long, value_name = "PORT", env = "PORT", default_value_t = 8080, value_hint = ValueHint::Other)]
     port: u16,
 
+    /// Megapixel cap for resize
+    #[arg(long, value_name = "MPCAP", env = "MPCAP")]
+    mp_cap: Option<f32>,
+
     /// Enable JXL encoding instead of WebP
-    #[arg(long)]
+    #[arg(long, env = "JXL", default_value_t = false)]
     jxl: bool,
 
     /// Control JXL encoding speed/effort level
@@ -40,6 +48,7 @@ struct ImageParams {
 
 // Server configuration that's shared between threads
 struct AppConfig {
+    mp_cap: Option<f32>,
     use_jxl: bool,
     encoder_speed: EncoderSpeed,
 }
@@ -65,19 +74,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create shared configuration
     let config = Arc::new(AppConfig {
         use_jxl: args.jxl,
+        mp_cap: args.mp_cap,
         encoder_speed: speed,
     });
 
     // Set up the server to listen on localhost with the specified port
     let addr = SocketAddr::new(args.host, args.port);
 
-    println!("Listening on http://{}", addr);
-    println!(
-        "Image format: {}",
-        if config.use_jxl { "JXL" } else { "WebP" }
-    );
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("tracing::info")),
+        )
+        .init();
+
+    tracing::info!("Listening on http://{}", addr);
+
     if config.use_jxl {
-        println!("JXL encoding speed: {:?}", config.encoder_speed);
+        tracing::info!("Using jxl backend with {:?} speed", config.encoder_speed);
+    } else {
+        tracing::info!("Using webp backend");
     }
 
     // Create a service that will handle incoming requests
@@ -178,12 +193,49 @@ fn get_filename_with_extension(url: &str, new_ext: &str) -> String {
     format!("{}.{}", stem, new_ext)
 }
 
+pub fn cap_megapixels(
+    dyn_img: &DynamicImage,
+    max_pixels: u64, // e.g. 4_000_000 for 4MP
+) -> Result<DynamicImage, Box<dyn std::error::Error>> {
+    let orig_w = dyn_img.width();
+    let orig_h = dyn_img.height();
+    let total_pixels = (orig_w as u64) * (orig_h as u64);
+
+    // 1. Pass through untouched if within budget
+    if total_pixels <= max_pixels {
+        return Ok(dyn_img.clone());
+    }
+
+    // 2. Calculate scaling factor based on area ratio
+    let scale = (max_pixels as f64 / total_pixels as f64).sqrt() as f32;
+    let target_w = ((orig_w as f32 * scale).round() as u32).max(1);
+    let target_h = ((orig_h as f32 * scale).round() as u32).max(1);
+
+    // 3. Prepare source buffer
+    let rgb8 = dyn_img.to_rgb8();
+    let src_image = Image::from_vec_u8(orig_w, orig_h, rgb8.into_raw(), PixelType::U8x3)?;
+
+    // 4. Allocate destination buffer
+    let mut dst_image = Image::new(target_w, target_h, PixelType::U8x3);
+
+    // 5. Downscale with Lanczos3 filter to eliminate screentone Moiré grid artifacts
+    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3));
+    let mut resizer = Resizer::new();
+    resizer.resize(&src_image, &mut dst_image, &options)?;
+
+    // 6. Wrap back into DynamicImage
+    let buffer = ImageBuffer::<Rgb<u8>, _>::from_raw(target_w, target_h, dst_image.into_vec())
+        .ok_or("Failed to construct image buffer")?;
+
+    Ok(DynamicImage::ImageRgb8(buffer))
+}
+
 // Main request handler - processes images based on URL parameters
 async fn handle_request(
     req: Request<Body>,
     config: Arc<AppConfig>,
 ) -> Result<Response<Body>, hyper::Error> {
-    println!("Received request: {:?}", req.uri());
+    tracing::info!("Received request: {:?}", req.uri());
 
     // Handle root path - show "bandwidth-hero-proxy" to make it work with the extension
     if req.uri().path() == "/" && req.uri().query().is_none() {
@@ -208,13 +260,14 @@ async fn handle_request(
 
     let params = parse_query(query);
     if params.url.is_empty() {
+        tracing::warn!("Missing image url");
         return Ok(Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(Body::from("Missing image URL"))
             .unwrap());
     }
 
-    println!(
+    tracing::info!(
         "Processing image: {} (quality: {}, grayscale: {}, format: {})",
         params.url,
         params.quality,
@@ -226,7 +279,7 @@ async fn handle_request(
     let response = match reqwest::get(&params.url).await {
         Ok(response) => response,
         Err(e) => {
-            println!("Error fetching image: {}", e);
+            tracing::error!("Error fetching image: {}", e);
             return Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(Body::from(format!("Error fetching image: {}", e)))
@@ -236,9 +289,13 @@ async fn handle_request(
 
     let status = response.status();
     if !status.is_success() {
+        tracing::warn!("Failed to get image, status code: {}", status);
         return Ok(Response::builder()
             .status(status)
-            .body(Body::from(format!("Error fetching image: {}", status)))
+            .body(Body::from(format!(
+                "Failed to get image, status code: {}",
+                status
+            )))
             .unwrap());
     }
 
@@ -246,7 +303,7 @@ async fn handle_request(
     let bytes = Arc::new(match response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
-            println!("Error reading image data: {}", e);
+            tracing::error!("Error reading image data: {}", e);
             return Ok(Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Body::from(format!("Error reading image: {}", e)))
@@ -258,6 +315,7 @@ async fn handle_request(
     let mut img = match image::load_from_memory(&bytes) {
         Ok(img) => img,
         Err(e) => {
+            tracing::error!("Error processing image: {}", e);
             return Ok(Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Body::from(format!("Error processing image: {}", e)))
@@ -268,6 +326,20 @@ async fn handle_request(
     // Convert to grayscale if requested
     if params.grayscale {
         img = convert_to_grayscale_optimized(&img);
+    }
+
+    if let Some(cap) = config.mp_cap {
+        let max_pixels = 1_000_000 * cap as u64;
+        img = match cap_megapixels(&img, max_pixels) {
+            Ok(img) => img,
+            Err(e) => {
+                tracing::error!("Fast image resize error: {}", e);
+                return Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from(format!("Fast image resize error: {}", e)))
+                    .unwrap());
+            }
+        };
     }
 
     if config.use_jxl {
@@ -287,7 +359,7 @@ async fn handle_request(
         let mut encoder = match encoder_builder().speed(config.encoder_speed).build() {
             Ok(encoder) => encoder,
             Err(e) => {
-                println!("JXL encoder creation error: {}", e);
+                tracing::error!("JXL encoder creation error: {}", e);
                 return Ok(Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .body(Body::from(format!("JXL encoder creation error: {}", e)))
@@ -296,7 +368,7 @@ async fn handle_request(
         };
 
         encoder.quality = jxl_quality;
-        encoder.lossless = params.quality >= 95;
+        encoder.lossless = Some(params.quality >= 95);
 
         // Convert to RGB for JXL encoding
         // Note: This drops alpha channel support for now
@@ -307,15 +379,13 @@ async fn handle_request(
             match encoder.encode(&raw_pixels, img.width(), img.height()) {
                 Ok(encoded) => encoded,
                 Err(e) => {
-                    println!("JXL encoding error: {}", e);
+                    tracing::error!("JXL encoder error: {}", e);
                     return Ok(Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
                         .body(Body::from(format!("JXL encoding error: {}", e)))
                         .unwrap());
                 }
             };
-
-        println!("Successfully processed image as JXL");
 
         // Return the JXL image
         let filename = get_filename_with_extension(&params.url, "jxl");
@@ -334,7 +404,7 @@ async fn handle_request(
         let webp_encoder = match webp::Encoder::from_image(&img) {
             Ok(encoder) => encoder,
             Err(e) => {
-                println!("WebP encoding error: {}", e);
+                tracing::error!("WebP encoding error: {}", e);
                 return Ok(Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .body(Body::from(format!("WebP encoding error: {}", e)))
@@ -343,7 +413,6 @@ async fn handle_request(
         };
 
         let webp_image = webp_encoder.encode(quality_float);
-        println!("Successfully processed image as WebP");
 
         // Return the WebP image
         Ok(Response::builder()
