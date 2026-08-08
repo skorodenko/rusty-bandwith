@@ -39,6 +39,8 @@
               pkgs-unstable.sccache
 
               pkg-config
+              libjxl
+              openssl
               alsa-lib
               wayland
               libxkbcommon
