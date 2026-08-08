@@ -1,19 +1,23 @@
 use clap::{Parser, ValueHint};
-use hyper::{Body, Request, Response, Server, StatusCode};
 use hyper::service::{make_service_fn, service_fn};
-use std::net::SocketAddr;
+use hyper::{Body, Request, Response, Server, StatusCode};
+use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba};
+use jpegxl_rs::{encode::EncoderResult, encode::EncoderSpeed, encoder_builder};
 use percent_encoding::percent_decode_str;
-use image::{DynamicImage, ImageBuffer, Rgba, GenericImageView};
-use std::sync::Arc;
-use jpegxl_rs::{encoder_builder, encode::EncoderSpeed, encode::EncoderResult};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
+use std::sync::Arc;
 
 // Command line arguments for configuring the server
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// Host addr to listen on
+    #[arg(long, value_name = "HOST", default_value_t = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))]
+    host: IpAddr,
+
     /// Port to listen on
-    #[arg(short, long, value_name = "PORT", default_value_t = 8080, value_hint = ValueHint::Other)]
+    #[arg(long, value_name = "PORT", default_value_t = 8080, value_hint = ValueHint::Other)]
     port: u16,
 
     /// Enable JXL encoding instead of WebP
@@ -30,8 +34,8 @@ struct Args {
 // Parameters extracted from the URL query string
 struct ImageParams {
     url: String,
-    quality: u8,      // 0-100, where 100 is highest quality
-    grayscale: bool,  // Convert to black and white if true
+    quality: u8,     // 0-100, where 100 is highest quality
+    grayscale: bool, // Convert to black and white if true
 }
 
 // Server configuration that's shared between threads
@@ -44,18 +48,18 @@ struct AppConfig {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Parse command line arguments
     let args = Args::parse();
-    
+
     // Map the speed argument (1-8) to JXL's encoder speed settings
     // Lower numbers = faster encoding but potentially lower quality
     let speed = match args.speed {
-        1 => EncoderSpeed::Lightning,  // Fastest
+        1 => EncoderSpeed::Lightning, // Fastest
         2 => EncoderSpeed::Thunder,
         3 => EncoderSpeed::Falcon,
         4 => EncoderSpeed::Cheetah,
         5 => EncoderSpeed::Hare,
         6 => EncoderSpeed::Wombat,
         7 => EncoderSpeed::Squirrel,
-        _ => EncoderSpeed::Tortoise,   // Slowest but highest quality
+        _ => EncoderSpeed::Tortoise, // Slowest but highest quality
     };
 
     // Create shared configuration
@@ -65,10 +69,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
 
     // Set up the server to listen on localhost with the specified port
-    let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
+    let addr = SocketAddr::new(args.host, args.port);
 
     println!("Listening on http://{}", addr);
-    println!("Image format: {}", if config.use_jxl { "JXL" } else { "WebP" });
+    println!(
+        "Image format: {}",
+        if config.use_jxl { "JXL" } else { "WebP" }
+    );
     if config.use_jxl {
         println!("JXL encoding speed: {:?}", config.encoder_speed);
     }
@@ -77,9 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config_clone = config.clone();
     let make_svc = make_service_fn(move |_conn| {
         let config = config_clone.clone();
-        async move {
-            Ok::<_, hyper::Error>(service_fn(move |req| handle_request(req, config.clone())))
-        }
+        async move { Ok::<_, hyper::Error>(service_fn(move |req| handle_request(req, config.clone()))) }
     });
 
     // Start the server
@@ -104,7 +109,7 @@ fn parse_query(query: &str) -> ImageParams {
 
     let mut image_params = ImageParams {
         url: String::new(),
-        quality: 80,    // Default to 80% quality
+        quality: 80,     // Default to 80% quality
         grayscale: true, // Default to grayscale
     };
 
@@ -116,7 +121,7 @@ fn parse_query(query: &str) -> ImageParams {
             "l" => {
                 let parsed_quality = value.parse().unwrap_or(80);
                 image_params.quality = parsed_quality.min(100).max(0);
-            },
+            }
             // Black and white mode (bw=0 means color, bw=1 means grayscale)
             "bw" => image_params.grayscale = value != "0",
             _ => {}
@@ -129,32 +134,35 @@ fn parse_query(query: &str) -> ImageParams {
 // Convert an image to grayscale while preserving alpha channels
 fn convert_to_grayscale_optimized(img: &DynamicImage) -> DynamicImage {
     let (width, height) = img.dimensions();
-    
+
     match img {
         // Handle RGBA images (with transparency)
         DynamicImage::ImageRgba8(rgba_img) => {
             let mut output = ImageBuffer::new(width, height);
             for (x, y, pixel) in rgba_img.enumerate_pixels() {
-                let luma = ((pixel[0] as u32 * 299 + pixel[1] as u32 * 587 + pixel[2] as u32 * 114) / 1000) as u8;
+                let luma = ((pixel[0] as u32 * 299 + pixel[1] as u32 * 587 + pixel[2] as u32 * 114)
+                    / 1000) as u8;
                 output.put_pixel(x, y, Rgba([luma, luma, luma, pixel[3]]));
             }
             DynamicImage::ImageRgba8(output)
-        },
+        }
         // Handle RGB images (no transparency)
         DynamicImage::ImageRgb8(rgb_img) => {
             let mut output = ImageBuffer::new(width, height);
             for (x, y, pixel) in rgb_img.enumerate_pixels() {
-                let luma = ((pixel[0] as u32 * 299 + pixel[1] as u32 * 587 + pixel[2] as u32 * 114) / 1000) as u8;
+                let luma = ((pixel[0] as u32 * 299 + pixel[1] as u32 * 587 + pixel[2] as u32 * 114)
+                    / 1000) as u8;
                 output.put_pixel(x, y, Rgba([luma, luma, luma, 255]));
             }
             DynamicImage::ImageRgba8(output)
-        },
+        }
         // Handle any other image format by converting to RGBA first
         _ => {
             let rgba = img.to_rgba8();
             let mut output = ImageBuffer::new(width, height);
             for (x, y, pixel) in rgba.enumerate_pixels() {
-                let luma = ((pixel[0] as u32 * 299 + pixel[1] as u32 * 587 + pixel[2] as u32 * 114) / 1000) as u8;
+                let luma = ((pixel[0] as u32 * 299 + pixel[1] as u32 * 587 + pixel[2] as u32 * 114)
+                    / 1000) as u8;
                 output.put_pixel(x, y, Rgba([luma, luma, luma, pixel[3]]));
             }
             DynamicImage::ImageRgba8(output)
@@ -166,14 +174,15 @@ fn convert_to_grayscale_optimized(img: &DynamicImage) -> DynamicImage {
 // Example: "https://example.com/photo.jpg" -> "photo.jxl"
 fn get_filename_with_extension(url: &str, new_ext: &str) -> String {
     let path = Path::new(url);
-    let stem = path.file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("image");
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
     format!("{}.{}", stem, new_ext)
 }
 
 // Main request handler - processes images based on URL parameters
-async fn handle_request(req: Request<Body>, config: Arc<AppConfig>) -> Result<Response<Body>, hyper::Error> {
+async fn handle_request(
+    req: Request<Body>,
+    config: Arc<AppConfig>,
+) -> Result<Response<Body>, hyper::Error> {
     println!("Received request: {:?}", req.uri());
 
     // Handle root path - show "bandwidth-hero-proxy" to make it work with the extension
@@ -190,7 +199,9 @@ async fn handle_request(req: Request<Body>, config: Arc<AppConfig>) -> Result<Re
         _none => {
             return Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
-                .body(Body::from("Missing query parameters. Use /?url=<image_url>&bw=<0|1>&l=<0-100>"))
+                .body(Body::from(
+                    "Missing query parameters. Use /?url=<image_url>&bw=<0|1>&l=<0-100>",
+                ))
                 .unwrap());
         }
     };
@@ -203,8 +214,13 @@ async fn handle_request(req: Request<Body>, config: Arc<AppConfig>) -> Result<Re
             .unwrap());
     }
 
-    println!("Processing image: {} (quality: {}, grayscale: {}, format: {})", 
-        params.url, params.quality, params.grayscale, if config.use_jxl { "JXL" } else { "WebP" });
+    println!(
+        "Processing image: {} (quality: {}, grayscale: {}, format: {})",
+        params.url,
+        params.quality,
+        params.grayscale,
+        if config.use_jxl { "JXL" } else { "WebP" }
+    );
 
     // Download the image
     let response = match reqwest::get(&params.url).await {
@@ -259,50 +275,45 @@ async fn handle_request(req: Request<Body>, config: Arc<AppConfig>) -> Result<Re
         // - Lower numbers mean better quality (0 is lossless)
         // - Higher numbers mean more compression
         let jxl_quality = if params.quality >= 95 {
-            0.0  // Use lossless mode for very high quality requests
+            0.0 // Use lossless mode for very high quality requests
         } else {
             let normalized = params.quality as f32 / 100.0;
             // Use exponential curve to make quality changes more gradual
             // This gives better quality preservation at lower input values
             8.0 * (1.0 - normalized.powf(0.7))
         };
-        
+
         // Create JXL encoder with the configured speed
-        let mut encoder = match encoder_builder()
-            .speed(config.encoder_speed)
-            .build() {
-                Ok(encoder) => encoder,
-                Err(e) => {
-                    println!("JXL encoder creation error: {}", e);
-                    return Ok(Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Body::from(format!("JXL encoder creation error: {}", e)))
-                        .unwrap());
-                }
-            };
+        let mut encoder = match encoder_builder().speed(config.encoder_speed).build() {
+            Ok(encoder) => encoder,
+            Err(e) => {
+                println!("JXL encoder creation error: {}", e);
+                return Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from(format!("JXL encoder creation error: {}", e)))
+                    .unwrap());
+            }
+        };
 
         encoder.quality = jxl_quality;
         encoder.lossless = params.quality >= 95;
-        
+
         // Convert to RGB for JXL encoding
         // Note: This drops alpha channel support for now
         let rgb = img.to_rgb8();
         let raw_pixels: Vec<u8> = rgb.into_raw();
-        
-        let encoded: EncoderResult<u8> = match encoder.encode(
-            &raw_pixels,
-            img.width(),
-            img.height()
-        ) {
-            Ok(encoded) => encoded,
-            Err(e) => {
-                println!("JXL encoding error: {}", e);
-                return Ok(Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Body::from(format!("JXL encoding error: {}", e)))
-                    .unwrap());
-            }
-        };
+
+        let encoded: EncoderResult<u8> =
+            match encoder.encode(&raw_pixels, img.width(), img.height()) {
+                Ok(encoded) => encoded,
+                Err(e) => {
+                    println!("JXL encoding error: {}", e);
+                    return Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::from(format!("JXL encoding error: {}", e)))
+                        .unwrap());
+                }
+            };
 
         println!("Successfully processed image as JXL");
 
@@ -311,7 +322,10 @@ async fn handle_request(req: Request<Body>, config: Arc<AppConfig>) -> Result<Re
         Ok(Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "image/jxl")
-            .header("Content-Disposition", format!("inline; filename=\"{}\"", filename))
+            .header(
+                "Content-Disposition",
+                format!("inline; filename=\"{}\"", filename),
+            )
             .body(Body::from(encoded.data))
             .unwrap())
     } else {
