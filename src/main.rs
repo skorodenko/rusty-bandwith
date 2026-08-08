@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config_clone = config.clone();
     let client = Client::new();
     let app = Router::new()
-        .route("/", get(handlers::root_handler))
+        .route("/", get(handlers::proxy_handler))
         .route("/{*path}", get(handlers::proxy_handler))
         .with_state(config_clone)
         .with_state(client);

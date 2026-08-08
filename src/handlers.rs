@@ -1,8 +1,7 @@
 use crate::cli::AppConfig;
 use crate::util;
 use axum::{
-    extract::Query,
-    extract::State,
+    extract::{rejection::QueryRejection, Query, RawQuery, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -18,13 +17,27 @@ pub struct ImageParams {
 }
 
 pub async fn root_handler() -> &'static str {
+    tracing::info!("Triggered root handler");
     "bandwidth-hero-proxy"
 }
 
 pub async fn proxy_handler(
-    Query(params): Query<ImageParams>,
+    RawQuery(raw_query): RawQuery,
+    params: Result<Query<ImageParams>, QueryRejection>,
     State(config): State<Arc<AppConfig>>,
 ) -> Result<Response, (StatusCode, String)> {
+    if raw_query.as_deref().unwrap_or("").is_empty() {
+        return Ok(root_handler().await.into_response());
+    }
+
+    let Query(params) = params.map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Missing or invalid query parameters. Use /?url=<image_url>&bw=<0|1>&l=<0-100>"
+                .to_string(),
+        )
+    })?;
+
     tracing::info!(
         "Processing image: {} (quality: {:?}, grayscale: {:?})",
         params.url,
@@ -95,15 +108,11 @@ pub async fn proxy_handler(
             })?;
         }
 
+        let img = img.into_rgba8();
+
         // WebP encoding - quality is straightforward 0-100
         let quality_float = params.l.map_or(80.0, |v| v as f32);
-        let webp_encoder = webp::Encoder::from_image(&img).map_err(|e| {
-            tracing::error!("WebP encoding error: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("WebP encoding error: {}", e),
-            )
-        })?;
+        let webp_encoder = webp::Encoder::from_rgba(&img, img.width(), img.height());
 
         Ok(webp_encoder.encode(quality_float).to_vec())
     })
