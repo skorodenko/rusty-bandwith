@@ -219,7 +219,7 @@ pub fn cap_megapixels(
     let mut dst_image = Image::new(target_w, target_h, PixelType::U8x3);
 
     // 5. Downscale with Lanczos3 filter to eliminate screentone Moiré grid artifacts
-    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3));
+    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::CatmullRom));
     let mut resizer = Resizer::new();
     resizer.resize(&src_image, &mut dst_image, &options)?;
 
