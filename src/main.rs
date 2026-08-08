@@ -42,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Start the server
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => {
-            tracing::info!("Listening on http://{}", addr);
+            tracing::info!("Started server on http://{}", addr);
             axum::serve(listener, app).await.unwrap();
         }
         Err(e) => {
