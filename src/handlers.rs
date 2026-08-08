@@ -67,44 +67,54 @@ pub async fn proxy_handler(
         )
     })?);
 
-    // Load and decode the image
-    let mut img = image::load_from_memory(&bytes).map_err(|e| {
-        tracing::error!("Error processing image: {e}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Error processing image: {e}"),
-        )
-    })?;
-
-    // Convert to grayscale if requested
-    params.bw.map(|v| {
-        if v == 1 {
-            img = util::convert_to_grayscale_optimized(&img);
-        }
-    });
-
-    if let Some(cap) = config.mp_cap {
-        let max_pixels = 1_000_000 * cap as u64;
-        img = util::cap_megapixels(&img, max_pixels).map_err(|e| {
-            tracing::error!("Fast image resize error: {}", e);
+    let webp_image = tokio::task::spawn_blocking(move || {
+        // Load and decode the image
+        let mut img = image::load_from_memory(&bytes).map_err(|e| {
+            tracing::error!("Error processing image: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Fast image resize error: {}", e),
+                format!("Error processing image: {e}"),
             )
         })?;
-    }
 
-    // WebP encoding - quality is straightforward 0-100
-    let quality_float = params.l.map_or(80.0, |v| v as f32);
-    let webp_encoder = webp::Encoder::from_image(&img).map_err(|e| {
-        tracing::error!("WebP encoding error: {}", e);
+        // Convert to grayscale if requested
+        params.bw.map(|v| {
+            if v == 1 {
+                img = util::convert_to_grayscale_optimized(&img);
+            }
+        });
+
+        if let Some(cap) = config.mp_cap {
+            let max_pixels = 1_000_000 * cap as u64;
+            img = util::cap_megapixels(&img, max_pixels).map_err(|e| {
+                tracing::error!("Fast image resize error: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Fast image resize error: {}", e),
+                )
+            })?;
+        }
+
+        // WebP encoding - quality is straightforward 0-100
+        let quality_float = params.l.map_or(80.0, |v| v as f32);
+        let webp_encoder = webp::Encoder::from_image(&img).map_err(|e| {
+            tracing::error!("WebP encoding error: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("WebP encoding error: {}", e),
+            )
+        })?;
+
+        Ok(webp_encoder.encode(quality_float).to_vec())
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("Blocking task panicked: {e}");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("WebP encoding error: {}", e),
+            "Internal processing error".to_string(),
         )
-    })?;
+    })??;
 
-    let webp_image = webp_encoder.encode(quality_float);
-
-    Ok(([(header::CONTENT_TYPE, "image/webp")], webp_image.to_vec()).into_response())
+    Ok(([(header::CONTENT_TYPE, "image/webp")], webp_image).into_response())
 }
