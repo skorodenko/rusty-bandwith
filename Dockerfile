@@ -31,7 +31,4 @@ RUN apk add --no-cache \
 
 COPY --from=builder /usr/src/app/target/release/rusty-bandwidth /usr/local/bin/rusty-bandwidth
 
-EXPOSE 8080
-
 ENTRYPOINT ["rusty-bandwidth"]
-CMD ["--host", "0.0.0.0", "--port", "8080"]
